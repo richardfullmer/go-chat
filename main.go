@@ -142,6 +142,7 @@ func main() {
 	server := newChatServer()
 
 	mux := http.NewServeMux()
+	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir("assets"))))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -251,19 +252,26 @@ const indexHTML = `<!doctype html>
   <title>Go Chat</title>
   <style>
     :root {
-      --bg: #f6f3ea;
-      --card: #fffdf8;
-      --ink: #1f2937;
-      --accent: #0f766e;
-      --muted: #6b7280;
-      --line: #e5dcc8;
+      --bg: #f4efe7;
+      --bg-2: #e9f1ec;
+      --card: #fffefb;
+      --ink: #1b2430;
+      --accent: #146c5d;
+      --accent-strong: #0f5a4d;
+      --muted: #6a7280;
+      --line: #e1d7c6;
+      --message-self: #e9f7f1;
+      --message-system: #eef7fb;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      font-family: "Avenir Next", "Segoe UI", "Trebuchet MS", sans-serif;
       color: var(--ink);
-      background: radial-gradient(circle at top left, #fff4d6, var(--bg));
+      background:
+        radial-gradient(900px 400px at -10% -10%, #fff4d8 20%, transparent 70%),
+        radial-gradient(900px 500px at 110% 0%, #deede6 20%, transparent 70%),
+        linear-gradient(170deg, var(--bg), var(--bg-2));
       min-height: 100vh;
       display: grid;
       place-items: center;
@@ -274,64 +282,108 @@ const indexHTML = `<!doctype html>
       height: min(80vh, 720px);
       background: var(--card);
       border: 1px solid var(--line);
-      border-radius: 14px;
+      border-radius: 18px;
       display: grid;
       grid-template-rows: auto 1fr auto;
       overflow: hidden;
-      box-shadow: 0 16px 40px rgba(0,0,0,0.08);
+      box-shadow: 0 18px 40px rgba(35, 35, 35, 0.12), 0 2px 8px rgba(35, 35, 35, 0.06);
+      backdrop-filter: blur(2px);
     }
     header {
-      padding: 14px 16px;
+      padding: 16px 18px;
       border-bottom: 1px solid var(--line);
       display: flex;
       justify-content: space-between;
       align-items: center;
+      background: linear-gradient(180deg, #fffaf1, #fff);
+      gap: 10px;
     }
-    header h1 { margin: 0; font-size: 18px; }
-    #status { color: var(--muted); font-size: 13px; }
+    .brand {
+      margin: 0;
+      display: flex;
+      align-items: center;
+    }
+    .brand img {
+      display: block;
+      width: clamp(170px, 35vw, 300px);
+      height: auto;
+    }
+    #status {
+      color: var(--muted);
+      font-size: 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 9px;
+      background: #fff;
+    }
     #messages {
       overflow-y: auto;
-      padding: 14px;
+      padding: 16px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 10px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.84), rgba(255,255,255,0.92));
     }
     .msg {
-      padding: 10px 12px;
+      max-width: min(80%, 650px);
+      padding: 10px 12px 11px;
       border: 1px solid var(--line);
-      border-radius: 10px;
+      border-radius: 13px;
       background: #fff;
+      animation: pop-in 160ms ease-out;
+    }
+    .msg.me {
+      align-self: flex-end;
+      background: var(--message-self);
+      border-color: #cceadd;
+    }
+    .msg.system {
+      background: var(--message-system);
+      border-color: #d4e7f3;
     }
     .sender {
       font-size: 12px;
       color: var(--muted);
-      margin-bottom: 4px;
+      margin-bottom: 5px;
+      font-weight: 600;
+      letter-spacing: 0.2px;
     }
     .sender.system { color: var(--accent); font-weight: 600; }
     form {
-      padding: 12px;
+      padding: 12px 14px 14px;
       border-top: 1px solid var(--line);
       display: grid;
       grid-template-columns: 1fr auto;
       gap: 8px;
+      background: linear-gradient(180deg, #fff, #fefbf5);
     }
     input, button {
       font: inherit;
-      border-radius: 10px;
+      border-radius: 11px;
       border: 1px solid var(--line);
       padding: 10px 12px;
+      transition: all 120ms ease;
+    }
+    input:focus {
+      outline: none;
+      border-color: #8eb5ab;
+      box-shadow: 0 0 0 3px rgba(20,108,93,0.14);
     }
     button {
       background: var(--accent);
       color: white;
       border-color: var(--accent);
       cursor: pointer;
+      font-weight: 600;
     }
+    button:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+    button:active { transform: translateY(1px); }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
     .overlay {
       position: absolute;
       inset: 0;
-      background: rgba(246, 243, 234, 0.95);
+      background: rgba(244, 239, 231, 0.95);
       display: grid;
       place-items: center;
       padding: 20px;
@@ -340,19 +392,34 @@ const indexHTML = `<!doctype html>
       width: min(420px, 100%);
       background: white;
       border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 18px;
+      border-radius: 14px;
+      padding: 20px;
       display: grid;
-      gap: 10px;
+      gap: 11px;
+      box-shadow: 0 14px 24px rgba(33, 33, 33, 0.12);
     }
-    .panel h2 { margin: 0; }
+    .panel h2 { margin: 0; font-size: 24px; line-height: 1; }
+    .panel label { font-size: 13px; color: var(--muted); }
     .root { position: relative; width: 100%; }
+    @keyframes pop-in {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @media (max-width: 720px) {
+      body { padding: 8px; }
+      .app { height: min(90vh, 760px); border-radius: 14px; }
+      #messages { padding: 12px; }
+      .msg { max-width: 92%; }
+      .brand img { width: clamp(145px, 48vw, 240px); }
+    }
   </style>
 </head>
 <body>
   <div class="root app" id="appRoot">
     <header>
-      <h1>Go Chat</h1>
+      <h1 class="brand">
+        <img src="/assets/groundhog-title.svg" alt="Groundhog Chat" />
+      </h1>
       <div id="status">Disconnected</div>
     </header>
     <main id="messages"></main>
@@ -381,12 +448,18 @@ const indexHTML = `<!doctype html>
     const sendBtn = document.getElementById("sendBtn");
 
     let userId = "";
+    let currentName = "";
     let lastMessageId = 0;
     let pollTimer = null;
 
     function addMessage(msg) {
       const wrap = document.createElement("article");
       wrap.className = "msg";
+      if (msg.sender === "system") {
+        wrap.classList.add("system");
+      } else if (msg.sender === currentName) {
+        wrap.classList.add("me");
+      }
 
       const sender = document.createElement("div");
       sender.className = "sender" + (msg.sender === "system" ? " system" : "");
@@ -436,6 +509,7 @@ const indexHTML = `<!doctype html>
 
       const data = await res.json();
       userId = data.user_id;
+      currentName = name;
       joinOverlay.style.display = "none";
       sendBtn.disabled = false;
       messageInput.focus();
