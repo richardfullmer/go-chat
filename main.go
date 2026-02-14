@@ -1,108 +1,136 @@
 package main
 
 import (
-	"bufio"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
-	"net"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
-type client struct {
-	name string
-	conn net.Conn
-	out  chan string
+type message struct {
+	ID        int64  `json:"id"`
+	Sender    string `json:"sender"`
+	Text      string `json:"text"`
+	Timestamp string `json:"timestamp"`
 }
 
 type chatServer struct {
-	mu      sync.Mutex
-	clients map[*client]struct{}
+	mu       sync.Mutex
+	users    map[string]string
+	messages []message
+	nextID   int64
 }
 
 func newChatServer() *chatServer {
-	return &chatServer{clients: make(map[*client]struct{})}
-}
-
-func (s *chatServer) addClient(c *client) {
-	s.mu.Lock()
-	s.clients[c] = struct{}{}
-	s.mu.Unlock()
-}
-
-func (s *chatServer) removeClient(c *client) {
-	s.mu.Lock()
-	if _, ok := s.clients[c]; ok {
-		delete(s.clients, c)
-		close(c.out)
+	return &chatServer{
+		users:    make(map[string]string),
+		messages: make([]message, 0, 128),
+		nextID:   1,
 	}
-	s.mu.Unlock()
 }
 
-func (s *chatServer) broadcast(msg string) {
+func (s *chatServer) addUser(name string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for c := range s.clients {
-		select {
-		case c.out <- msg:
-		default:
-			// Skip slow clients instead of blocking all chat traffic.
-		}
+	id := randomID(16)
+	s.users[id] = name
+	s.appendMessageLocked("system", fmt.Sprintf("%s joined the chat", name))
+	return id
+}
+
+func (s *chatServer) removeUser(userID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	name, ok := s.users[userID]
+	if !ok {
+		return
+	}
+	delete(s.users, userID)
+	s.appendMessageLocked("system", fmt.Sprintf("%s left the chat", name))
+}
+
+func (s *chatServer) postMessage(userID, text string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sender, ok := s.users[userID]
+	if !ok {
+		return fmt.Errorf("unknown user")
+	}
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("message is empty")
+	}
+	s.appendMessageLocked(sender, text)
+	return nil
+}
+
+func (s *chatServer) messagesAfter(lastID int64) []message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.messages) == 0 {
+		return nil
+	}
+
+	idx := 0
+	for idx < len(s.messages) && s.messages[idx].ID <= lastID {
+		idx++
+	}
+	if idx >= len(s.messages) {
+		return nil
+	}
+
+	out := make([]message, len(s.messages)-idx)
+	copy(out, s.messages[idx:])
+	return out
+}
+
+func (s *chatServer) appendMessageLocked(sender, text string) {
+	s.messages = append(s.messages, message{
+		ID:        s.nextID,
+		Sender:    sender,
+		Text:      text,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+	s.nextID++
+
+	if len(s.messages) > 1000 {
+		s.messages = s.messages[len(s.messages)-1000:]
 	}
 }
 
-func handleConnection(conn net.Conn, server *chatServer) {
-	defer conn.Close()
-
-	fmt.Fprintln(conn, "Welcome to Go Chat")
-	fmt.Fprintln(conn, "Enter your name:")
-
-	scanner := bufio.NewScanner(conn)
-	if !scanner.Scan() {
-		return
+func randomID(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
+	return hex.EncodeToString(b)
+}
 
-	name := strings.TrimSpace(scanner.Text())
-	if name == "" {
-		name = conn.RemoteAddr().String()
-	}
+type joinRequest struct {
+	Name string `json:"name"`
+}
 
-	c := &client{
-		name: name,
-		conn: conn,
-		out:  make(chan string, 16),
-	}
+type joinResponse struct {
+	UserID string `json:"user_id"`
+}
 
-	server.addClient(c)
-	server.broadcast(fmt.Sprintf("* %s joined the chat", c.name))
-	c.out <- "You are connected. Type /quit to leave."
+type sendRequest struct {
+	UserID string `json:"user_id"`
+	Text   string `json:"text"`
+}
 
-	writerDone := make(chan struct{})
-	go func() {
-		defer close(writerDone)
-		for msg := range c.out {
-			if _, err := fmt.Fprintln(conn, msg); err != nil {
-				return
-			}
-		}
-	}()
-
-	for scanner.Scan() {
-		text := strings.TrimSpace(scanner.Text())
-		if text == "" {
-			continue
-		}
-		if text == "/quit" {
-			break
-		}
-		server.broadcast(fmt.Sprintf("[%s] %s", c.name, text))
-	}
-
-	server.removeClient(c)
-	server.broadcast(fmt.Sprintf("* %s left the chat", c.name))
-	<-writerDone
+type leaveRequest struct {
+	UserID string `json:"user_id"`
 }
 
 func main() {
@@ -111,21 +139,331 @@ func main() {
 		port = "8080"
 	}
 
-	ln, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		log.Fatalf("failed to listen on port %s: %v", port, err)
-	}
-	defer ln.Close()
-
-	log.Printf("chat server listening on :%s", port)
-
 	server := newChatServer()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Printf("accept error: %v", err)
-			continue
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
 		}
-		go handleConnection(conn, server)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(indexHTML))
+	})
+
+	mux.HandleFunc("/api/join", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req joinRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		name := strings.TrimSpace(req.Name)
+		if name == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+		if len(name) > 32 {
+			name = name[:32]
+		}
+
+		userID := server.addUser(name)
+		writeJSON(w, http.StatusOK, joinResponse{UserID: userID})
+	})
+
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req sendRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		req.Text = strings.TrimSpace(req.Text)
+		if len(req.Text) > 500 {
+			req.Text = req.Text[:500]
+		}
+		if err := server.postMessage(req.UserID, req.Text); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	})
+
+	mux.HandleFunc("/api/leave", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req leaveRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		server.removeUser(req.UserID)
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	})
+
+	mux.HandleFunc("/api/messages", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		sinceStr := r.URL.Query().Get("since")
+		var since int64
+		if sinceStr != "" {
+			parsed, err := strconv.ParseInt(sinceStr, 10, 64)
+			if err != nil {
+				http.Error(w, "invalid since parameter", http.StatusBadRequest)
+				return
+			}
+			since = parsed
+		}
+		msgs := server.messagesAfter(since)
+		if msgs == nil {
+			msgs = []message{}
+		}
+		writeJSON(w, http.StatusOK, map[string][]message{"messages": msgs})
+	})
+
+	log.Printf("web chat listening on http://0.0.0.0:%s", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		log.Fatalf("server error: %v", err)
 	}
 }
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+const indexHTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Go Chat</title>
+  <style>
+    :root {
+      --bg: #f6f3ea;
+      --card: #fffdf8;
+      --ink: #1f2937;
+      --accent: #0f766e;
+      --muted: #6b7280;
+      --line: #e5dcc8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at top left, #fff4d6, var(--bg));
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 16px;
+    }
+    .app {
+      width: min(880px, 100%);
+      height: min(80vh, 720px);
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      overflow: hidden;
+      box-shadow: 0 16px 40px rgba(0,0,0,0.08);
+    }
+    header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    header h1 { margin: 0; font-size: 18px; }
+    #status { color: var(--muted); font-size: 13px; }
+    #messages {
+      overflow-y: auto;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .msg {
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+    }
+    .sender {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .sender.system { color: var(--accent); font-weight: 600; }
+    form {
+      padding: 12px;
+      border-top: 1px solid var(--line);
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+    }
+    input, button {
+      font: inherit;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+    }
+    button {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(246, 243, 234, 0.95);
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .panel {
+      width: min(420px, 100%);
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 18px;
+      display: grid;
+      gap: 10px;
+    }
+    .panel h2 { margin: 0; }
+    .root { position: relative; width: 100%; }
+  </style>
+</head>
+<body>
+  <div class="root app" id="appRoot">
+    <header>
+      <h1>Go Chat</h1>
+      <div id="status">Disconnected</div>
+    </header>
+    <main id="messages"></main>
+    <form id="sendForm">
+      <input id="messageInput" placeholder="Type a message" maxlength="500" autocomplete="off" />
+      <button id="sendBtn" type="submit" disabled>Send</button>
+    </form>
+    <div class="overlay" id="joinOverlay">
+      <form class="panel" id="joinForm">
+        <h2>Join chat</h2>
+        <label for="nameInput">Display name</label>
+        <input id="nameInput" maxlength="32" required placeholder="Your name" autocomplete="nickname" />
+        <button type="submit">Join</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById("status");
+    const messagesEl = document.getElementById("messages");
+    const joinOverlay = document.getElementById("joinOverlay");
+    const joinForm = document.getElementById("joinForm");
+    const nameInput = document.getElementById("nameInput");
+    const sendForm = document.getElementById("sendForm");
+    const messageInput = document.getElementById("messageInput");
+    const sendBtn = document.getElementById("sendBtn");
+
+    let userId = "";
+    let lastMessageId = 0;
+    let pollTimer = null;
+
+    function addMessage(msg) {
+      const wrap = document.createElement("article");
+      wrap.className = "msg";
+
+      const sender = document.createElement("div");
+      sender.className = "sender" + (msg.sender === "system" ? " system" : "");
+      sender.textContent = msg.sender;
+
+      const text = document.createElement("div");
+      text.textContent = msg.text;
+
+      wrap.appendChild(sender);
+      wrap.appendChild(text);
+      messagesEl.appendChild(wrap);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    async function pollMessages() {
+      if (!userId) return;
+      try {
+        const res = await fetch("/api/messages?since=" + lastMessageId);
+        if (!res.ok) throw new Error("poll failed");
+        const data = await res.json();
+        for (const msg of data.messages) {
+          addMessage(msg);
+          if (msg.id > lastMessageId) lastMessageId = msg.id;
+        }
+      } catch (err) {
+        statusEl.textContent = "Connection issue... retrying";
+      } finally {
+        pollTimer = setTimeout(pollMessages, 1000);
+      }
+    }
+
+    joinForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const name = nameInput.value.trim();
+      if (!name) return;
+
+      const res = await fetch("/api/join", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+
+      if (!res.ok) {
+        alert("Unable to join chat");
+        return;
+      }
+
+      const data = await res.json();
+      userId = data.user_id;
+      joinOverlay.style.display = "none";
+      sendBtn.disabled = false;
+      messageInput.focus();
+      statusEl.textContent = "Connected as " + name;
+      pollMessages();
+    });
+
+    sendForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const text = messageInput.value.trim();
+      if (!text || !userId) return;
+
+      const res = await fetch("/api/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId, text })
+      });
+
+      if (res.ok) {
+        messageInput.value = "";
+      }
+    });
+
+    window.addEventListener("beforeunload", () => {
+      if (!userId) return;
+      navigator.sendBeacon("/api/leave", new Blob([JSON.stringify({ user_id: userId })], { type: "application/json" }));
+      clearTimeout(pollTimer);
+    });
+  </script>
+</body>
+</html>`
