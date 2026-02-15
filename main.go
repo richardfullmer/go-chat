@@ -19,6 +19,8 @@ type message struct {
 	Sender    string `json:"sender"`
 	Text      string `json:"text"`
 	Timestamp string `json:"timestamp"`
+	Reactions map[string]int `json:"reactions,omitempty"`
+	LastEventID int64 `json:"last_event_id"`
 }
 
 type chatServer struct {
@@ -26,6 +28,7 @@ type chatServer struct {
 	users    map[string]string
 	messages []message
 	nextID   int64
+	nextEventID int64
 }
 
 func newChatServer() *chatServer {
@@ -33,6 +36,7 @@ func newChatServer() *chatServer {
 		users:    make(map[string]string),
 		messages: make([]message, 0, 128),
 		nextID:   1,
+		nextEventID: 1,
 	}
 }
 
@@ -73,35 +77,45 @@ func (s *chatServer) postMessage(userID, text string) error {
 	return nil
 }
 
-func (s *chatServer) messagesAfter(lastID int64) []message {
+func (s *chatServer) messagesAfter(lastEventID int64) []message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.messages) == 0 {
-		return nil
+	out := make([]message, 0, len(s.messages))
+	for _, msg := range s.messages {
+		if msg.LastEventID <= lastEventID {
+			continue
+		}
+		copyMsg := message{
+			ID:           msg.ID,
+			Sender:       msg.Sender,
+			Text:         msg.Text,
+			Timestamp:    msg.Timestamp,
+			LastEventID:  msg.LastEventID,
+		}
+		if len(msg.Reactions) > 0 {
+			copyMsg.Reactions = make(map[string]int, len(msg.Reactions))
+			for k, v := range msg.Reactions {
+				copyMsg.Reactions[k] = v
+			}
+		}
+		out = append(out, copyMsg)
 	}
-
-	idx := 0
-	for idx < len(s.messages) && s.messages[idx].ID <= lastID {
-		idx++
-	}
-	if idx >= len(s.messages) {
-		return nil
-	}
-
-	out := make([]message, len(s.messages)-idx)
-	copy(out, s.messages[idx:])
 	return out
 }
 
 func (s *chatServer) appendMessageLocked(sender, text string) {
-	s.messages = append(s.messages, message{
-		ID:        s.nextID,
-		Sender:    sender,
-		Text:      text,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-	})
+	msg := message{
+		ID:           s.nextID,
+		Sender:       sender,
+		Text:         text,
+		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		Reactions:    make(map[string]int),
+		LastEventID:  s.nextEventID,
+	}
+	s.messages = append(s.messages, msg)
 	s.nextID++
+	s.nextEventID++
 
 	if len(s.messages) > 1000 {
 		s.messages = s.messages[len(s.messages)-1000:]
@@ -114,6 +128,38 @@ func randomID(n int) string {
 		return strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
 	return hex.EncodeToString(b)
+}
+
+var reactionWhitelist = map[string]struct{}{
+	"👍": {},
+	"❤️": {},
+	"😂": {},
+	"🎉": {},
+}
+
+func (s *chatServer) addReaction(userID string, messageID int64, reaction string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.users[userID]; !ok {
+		return fmt.Errorf("unknown user")
+	}
+	if _, ok := reactionWhitelist[reaction]; !ok {
+		return fmt.Errorf("unsupported reaction")
+	}
+
+	for i := range s.messages {
+		if s.messages[i].ID == messageID {
+			if s.messages[i].Reactions == nil {
+				s.messages[i].Reactions = make(map[string]int)
+			}
+			s.messages[i].Reactions[reaction]++
+			s.messages[i].LastEventID = s.nextEventID
+			s.nextEventID++
+			return nil
+		}
+	}
+	return fmt.Errorf("message not found")
 }
 
 type joinRequest struct {
@@ -131,6 +177,12 @@ type sendRequest struct {
 
 type leaveRequest struct {
 	UserID string `json:"user_id"`
+}
+
+type reactRequest struct {
+	UserID    string `json:"user_id"`
+	MessageID int64  `json:"message_id"`
+	Reaction  string `json:"reaction"`
 }
 
 func main() {
@@ -196,6 +248,27 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	})
 
+	mux.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req reactRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if req.Reaction == "" {
+			http.Error(w, "reaction is required", http.StatusBadRequest)
+			return
+		}
+		if err := server.addReaction(req.UserID, req.MessageID, req.Reaction); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	})
+
 	mux.HandleFunc("/api/leave", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -216,16 +289,16 @@ func main() {
 			return
 		}
 		sinceStr := r.URL.Query().Get("since")
-		var since int64
+		var lastEventID int64
 		if sinceStr != "" {
 			parsed, err := strconv.ParseInt(sinceStr, 10, 64)
 			if err != nil {
 				http.Error(w, "invalid since parameter", http.StatusBadRequest)
 				return
 			}
-			since = parsed
+			lastEventID = parsed
 		}
-		msgs := server.messagesAfter(since)
+		msgs := server.messagesAfter(lastEventID)
 		if msgs == nil {
 			msgs = []message{}
 		}
@@ -342,6 +415,34 @@ const indexHTML = `<!doctype html>
       background: var(--message-system);
       border-color: #d4e7f3;
     }
+    .msg-reactions {
+      margin-top: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .reaction-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #f6fbf9;
+      color: var(--ink);
+      font-size: 13px;
+      padding: 4px 10px;
+      cursor: pointer;
+      transition: border-color 120ms ease, background 120ms ease;
+    }
+    .reaction-btn:hover {
+      border-color: var(--accent);
+      background: #e8f5ef;
+    }
+    .reaction-count {
+      font-weight: 600;
+      font-size: 12px;
+      color: var(--accent-strong);
+    }
     .sender {
       font-size: 12px;
       color: var(--muted);
@@ -449,10 +550,12 @@ const indexHTML = `<!doctype html>
 
     let userId = "";
     let currentName = "";
-    let lastMessageId = 0;
+    let lastEventID = 0;
     let pollTimer = null;
+    const reactionOptions = ["👍", "❤️", "😂", "🎉"];
+    const messageStates = new Map();
 
-    function addMessage(msg) {
+    function createMessageElement(msg) {
       const wrap = document.createElement("article");
       wrap.className = "msg";
       if (msg.sender === "system") {
@@ -468,26 +571,92 @@ const indexHTML = `<!doctype html>
       const text = document.createElement("div");
       text.textContent = msg.text;
 
+      const reactions = document.createElement("div");
+      reactions.className = "msg-reactions";
+
       wrap.appendChild(sender);
       wrap.appendChild(text);
-      messagesEl.appendChild(wrap);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      wrap.appendChild(reactions);
+
+      return { wrap, reactions };
+    }
+
+    function updateMessageReactions(msg, state) {
+      const reactionContainer = state.reactions;
+      reactionContainer.innerHTML = "";
+      for (const reaction of reactionOptions) {
+        const count = (msg.reactions && msg.reactions[reaction]) || 0;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "reaction-btn";
+        button.dataset.messageId = msg.id;
+        button.dataset.reaction = reaction;
+
+        const emoji = document.createElement("span");
+        emoji.textContent = reaction;
+        button.appendChild(emoji);
+
+        if (count > 0) {
+          const countEl = document.createElement("span");
+          countEl.className = "reaction-count";
+          countEl.textContent = count;
+          button.appendChild(countEl);
+        }
+
+        reactionContainer.appendChild(button);
+      }
+    }
+
+    function renderMessage(msg) {
+      let state = messageStates.get(msg.id);
+      if (!state) {
+        state = createMessageElement(msg);
+        messageStates.set(msg.id, state);
+        messagesEl.appendChild(state.wrap);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+      updateMessageReactions(msg, state);
     }
 
     async function pollMessages() {
       if (!userId) return;
       try {
-        const res = await fetch("/api/messages?since=" + lastMessageId);
+        const res = await fetch("/api/messages?since=" + lastEventID);
         if (!res.ok) throw new Error("poll failed");
         const data = await res.json();
         for (const msg of data.messages) {
-          addMessage(msg);
-          if (msg.id > lastMessageId) lastMessageId = msg.id;
+          renderMessage(msg);
+          if (msg.last_event_id > lastEventID) lastEventID = msg.last_event_id;
         }
       } catch (err) {
         statusEl.textContent = "Connection issue... retrying";
       } finally {
         pollTimer = setTimeout(pollMessages, 1000);
+      }
+    }
+
+    messagesEl.addEventListener("click", (event) => {
+      const button = event.target.closest("button.reaction-btn");
+      if (!button) return;
+      const messageId = Number(button.dataset.messageId);
+      const reaction = button.dataset.reaction;
+      if (!userId || Number.isNaN(messageId) || !reaction) return;
+      sendReaction(messageId, reaction);
+    });
+
+    async function sendReaction(messageId, reaction) {
+      try {
+        await fetch("/api/react", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_id: userId,
+            message_id: messageId,
+            reaction,
+          })
+        });
+      } catch (err) {
+        console.error("reaction failed", err);
       }
     }
 
